@@ -1,0 +1,24 @@
+{
+  "name": "ledgertrail-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LedgerTrail API - Express on SQL Server",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --no-warnings --env-file-if-exists=.env src/index.js",
+    "dev": "node --no-warnings --env-file-if-exists=.env --watch src/index.js",
+    "migrate": "node --no-warnings scripts/migrate.mjs",
+    "check-db": "node --no-warnings scripts/check-db.mjs",
+    "reset-db": "node --no-warnings scripts/reset-db.mjs",
+    "load-dump": "node --no-warnings scripts/load-dump.mjs"
+  },
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "mssql": "^12.7.9"
+  }
+}
