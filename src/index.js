@@ -4,6 +4,7 @@ import { migrate, dbLabel, close } from './db/index.js';
 import { seedAdminUser } from './db/seed.js';
 import { attachUser } from './lib/auth.js';
 import { ApiError, translateDbError } from './lib/http.js';
+import { APP_NAME } from './lib/brand.js';
 
 import companies from './routes/companies.js';
 import masters from './routes/masters.js';
@@ -22,7 +23,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(attachUser);
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', product: 'LedgerTrail', engine: 'SQL Server', database: dbLabel() });
+  res.json({ status: 'ok', product: APP_NAME, engine: 'SQL Server', database: dbLabel() });
 });
 
 app.use('/api/auth', auth);
@@ -62,7 +63,7 @@ async function start() {
   }
 
   const server = app.listen(PORT, () => {
-    console.log(`LedgerTrail API listening on http://localhost:${PORT}`);
+    console.log(`${APP_NAME} API listening on http://localhost:${PORT}`);
     console.log(`Database: ${dbLabel()}`);
   });
 

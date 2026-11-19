@@ -3,6 +3,7 @@ import { MASTERS, createMaster } from './masters.js';
 import { createVoucher } from './vouchers.js';
 import { getCompany, createCompany } from './companies.js';
 import { badRequest, notFound } from '../lib/http.js';
+import { APP_NAME } from '../lib/brand.js';
 import { trialBalance, stockSummary, ledgerBalances, period } from './reports.js';
 import { listVouchers } from './vouchers.js';
 import { listLog } from './editlog.js';
@@ -97,7 +98,7 @@ export async function backupCompany(companyId) {
  */
 export async function restoreCompany(dump, { name } = {}) {
   if (!dump || dump.format !== 'ledgertrail.backup') {
-    throw badRequest('That file is not a LedgerTrail backup');
+    throw badRequest(`That file is not a ${APP_NAME} backup`);
   }
   const src = dump.company;
   if (!src) throw badRequest('The backup has no company record');

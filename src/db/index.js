@@ -1,6 +1,7 @@
 import sql from 'mssql';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { SCHEMA } from './schema.js';
+import { APP_NAME } from '../lib/brand.js';
 
 /**
  * SQL Server data layer.
@@ -25,7 +26,7 @@ function baseConfig(database) {
       encrypt: process.env.SQLSERVER_ENCRYPT !== 'false',
       trustServerCertificate: process.env.SQLSERVER_TRUST_CERT !== 'false',
       enableArithAbort: true,
-      appName: 'LedgerTrail',
+      appName: APP_NAME,
     },
     pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
     connectionTimeout: 15000,
