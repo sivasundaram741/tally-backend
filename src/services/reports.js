@@ -1,10 +1,48 @@
-import { all, get } from '../db/index.js';
-import { money, toNum } from '../lib/http.js';
+import { find, findOne, count, aggregate, namesById } from '../db/index.js';
+import { money } from '../lib/http.js';
 import { financialYearEnd } from './companies.js';
+
+/** Vouchers that count towards the books: not deleted, cancelled or optional. */
+const posted = (companyId) => ({ company_id: companyId, is_deleted: 0, is_cancelled: 0, is_optional: 0 });
+
+/** Ledger movement summed per ledger and side, for vouchers matching `match`. */
+async function entryTotals(match) {
+  const rows = await aggregate('vouchers', [
+    { $match: match },
+    { $unwind: '$entries' },
+    {
+      $group: {
+        _id: { ledger_id: '$entries.ledger_id', dr_cr: '$entries.dr_cr' },
+        amt: { $sum: '$entries.amount' },
+      },
+    },
+  ]);
+  return rows.map((r) => ({ ledger_id: r._id.ledger_id, dr_cr: r._id.dr_cr, amt: r.amt }));
+}
+
+/** Stock movement summed per item and direction, for vouchers matching `match`. */
+async function inventoryTotals(match) {
+  const rows = await aggregate('vouchers', [
+    { $match: match },
+    { $unwind: '$inventory' },
+    {
+      $group: {
+        _id: { stock_item_id: '$inventory.stock_item_id', direction: '$inventory.direction' },
+        qty: { $sum: '$inventory.quantity' },
+        amt: { $sum: '$inventory.amount' },
+      },
+    },
+  ]);
+  return rows.map((r) => ({
+    stock_item_id: r._id.stock_item_id, direction: r._id.direction, qty: r.qty, amt: r.amt,
+  }));
+}
 
 /** Resolves the reporting period, defaulting to the company financial year. */
 export async function period(companyId, q = {}) {
-  const c = await get('SELECT financial_year_from, books_begin_from FROM companies WHERE id = ?', [companyId]);
+  const c = await findOne('companies', { id: companyId }, {
+    project: { financial_year_from: 1, books_begin_from: 1 },
+  });
   const fyFrom = c?.financial_year_from || `${new Date().getFullYear()}-04-01`;
   return {
     from: q.from || c?.books_begin_from || fyFrom,
@@ -21,30 +59,16 @@ const SIGN = (drCr) => (drCr === 'Dr' ? 1 : -1);
  * Signed amounts are debit-positive.
  */
 export async function ledgerBalances(companyId, { from, to } = {}) {
-  const ledgers = await all(
-    `SELECT l.*, g.name AS group_name, g.nature, g.id AS gid
-       FROM ledgers l JOIN groups g ON g.id = l.group_id
-      WHERE l.company_id = ? ORDER BY l.name COLLATE NOCASE`,
-    [companyId],
-  );
-
-  const movements = await all(
-    `SELECT e.ledger_id, e.dr_cr, SUM(e.amount) AS amt
-       FROM voucher_entries e JOIN vouchers v ON v.id = e.voucher_id
-      WHERE v.company_id = ? AND v.is_deleted = 0 AND v.is_cancelled = 0
-        AND v.is_optional = 0 AND v.date >= ? AND v.date <= ?
-      GROUP BY e.ledger_id, e.dr_cr`,
-    [companyId, from, to],
-  );
-
-  const priors = await all(
-    `SELECT e.ledger_id, e.dr_cr, SUM(e.amount) AS amt
-       FROM voucher_entries e JOIN vouchers v ON v.id = e.voucher_id
-      WHERE v.company_id = ? AND v.is_deleted = 0 AND v.is_cancelled = 0
-        AND v.is_optional = 0 AND v.date < ?
-      GROUP BY e.ledger_id, e.dr_cr`,
-    [companyId, from],
-  );
+  const [ledgerRows, groups, movements, priors] = await Promise.all([
+    find('ledgers', { company_id: companyId }, { sort: { name: 1 } }),
+    find('groups', { company_id: companyId }, { project: { id: 1, name: 1, nature: 1 } }),
+    entryTotals({ ...posted(companyId), date: { $gte: from, $lte: to } }),
+    entryTotals({ ...posted(companyId), date: { $lt: from } }),
+  ]);
+  const groupById = new Map(groups.map((g) => [g.id, g]));
+  const ledgers = ledgerRows
+    .filter((l) => groupById.has(l.group_id))
+    .map((l) => ({ ...l, group_name: groupById.get(l.group_id).name, nature: groupById.get(l.group_id).nature }));
 
   const mv = new Map();
   for (const m of movements) {
@@ -81,10 +105,7 @@ export async function ledgerBalances(companyId, { from, to } = {}) {
 }
 
 function groupRows(companyId) {
-  return all(
-    `SELECT * FROM groups WHERE company_id = ? ORDER BY sort_position, name COLLATE NOCASE`,
-    [companyId],
-  );
+  return find('groups', { company_id: companyId }, { sort: { sort_position: 1, name: 1 } });
 }
 
 /**
@@ -153,15 +174,10 @@ function sumNature(roots, natures) {
 
 /** Closing stock value from inventory movement plus opening stock. */
 export async function closingStockValue(companyId, { from, to } = {}) {
-  const items = await all('SELECT id, opening_qty, opening_rate, opening_value FROM stock_items WHERE company_id = ?', [companyId]);
-  const moves = await all(
-    `SELECT i.stock_item_id, i.direction, SUM(i.quantity) AS qty, SUM(i.amount) AS amt
-       FROM voucher_inventory i JOIN vouchers v ON v.id = i.voucher_id
-      WHERE v.company_id = ? AND v.is_deleted = 0 AND v.is_cancelled = 0 AND v.is_optional = 0
-        AND v.date <= ?
-      GROUP BY i.stock_item_id, i.direction`,
-    [companyId, to],
-  );
+  const items = await find('stock_items', { company_id: companyId }, {
+    project: { id: 1, opening_qty: 1, opening_rate: 1, opening_value: 1 },
+  });
+  const moves = await inventoryTotals({ ...posted(companyId), date: { $lte: to } });
   const map = new Map();
   for (const m of moves) {
     const cur = map.get(m.stock_item_id) || { inQty: 0, inAmt: 0, outQty: 0, outAmt: 0 };
@@ -183,7 +199,9 @@ export async function closingStockValue(companyId, { from, to } = {}) {
 }
 
 export async function openingStockValue(companyId) {
-  const items = await all('SELECT opening_qty, opening_rate, opening_value FROM stock_items WHERE company_id = ?', [companyId]);
+  const items = await find('stock_items', { company_id: companyId }, {
+    project: { opening_qty: 1, opening_rate: 1, opening_value: 1 },
+  });
   return money(items.reduce((s, i) => s + (i.opening_value || i.opening_qty * i.opening_rate), 0));
 }
 
@@ -311,7 +329,7 @@ export async function profitAndLoss(companyId, q = {}) {
 /** Balance Sheet with the Profit & Loss A/c carried into Liabilities. */
 export async function balanceSheet(companyId, q = {}) {
   const p = await period(companyId, q);
-  const pl = await get("SELECT id FROM ledgers WHERE company_id = ? AND name = 'Profit & Loss A/c'", [companyId]);
+  const pl = await findOne('ledgers', { company_id: companyId, name: 'Profit & Loss A/c' }, { project: { id: 1 } });
   const skip = new Set(pl ? [pl.id] : []);
   const { roots } = await groupTree(companyId, p, { skipLedgerIds: skip });
 
@@ -326,7 +344,7 @@ export async function balanceSheet(companyId, q = {}) {
 
   const plReport = await profitAndLoss(companyId, q);
   const plRow = pl
-    ? await get('SELECT opening_balance, opening_balance_type FROM ledgers WHERE id = ?', [pl.id])
+    ? await findOne('ledgers', { id: pl.id }, { project: { opening_balance: 1, opening_balance_type: 1 } })
     : null;
   const plOpening = plRow ? money(SIGN(plRow.opening_balance_type) * plRow.opening_balance) : 0;
   const closingStock = plReport.summary.closingStock;
@@ -368,41 +386,53 @@ export async function balanceSheet(companyId, q = {}) {
 /** Ledger vouchers (account statement) for one ledger. */
 export async function ledgerStatement(companyId, ledgerId, q = {}) {
   const p = await period(companyId, q);
-  const ledger = await get(
-    `SELECT l.*, g.name AS group_name FROM ledgers l JOIN groups g ON g.id = l.group_id
-      WHERE l.id = ? AND l.company_id = ?`,
-    [ledgerId, companyId],
-  );
-  if (!ledger) return null;
+  const ledgerRow = await findOne('ledgers', { id: ledgerId, company_id: companyId });
+  const group = ledgerRow && await findOne('groups', { id: ledgerRow.group_id }, { project: { name: 1 } });
+  if (!ledgerRow || !group) return null;
+  const ledger = { ...ledgerRow, group_name: group.name };
 
   const balances = await ledgerBalances(companyId, p);
   const bal = balances.find((b) => b.id === Number(ledgerId));
-  const rows = await all(
-    `SELECT v.id, v.date, v.voucher_number, v.narration, v.is_cancelled,
-            vt.name AS voucher_type_name, e.dr_cr, e.amount, e.id AS entry_id
-       FROM voucher_entries e
-       JOIN vouchers v ON v.id = e.voucher_id
-       JOIN voucher_types vt ON vt.id = v.voucher_type_id
-      WHERE v.company_id = ? AND e.ledger_id = ? AND v.is_deleted = 0
-        AND v.date >= ? AND v.date <= ?
-      ORDER BY v.date, v.id`,
-    [companyId, ledgerId, p.from, p.to],
-  );
 
-  // every contra entry in one query rather than one query per line
-  const voucherIds = [...new Set(rows.map((r) => r.id))];
-  const contraRows = voucherIds.length
-    ? await all(
-      `SELECT e.voucher_id, l.name, e.dr_cr, e.amount FROM voucher_entries e
-         JOIN ledgers l ON l.id = e.ledger_id
-        WHERE e.voucher_id IN (${voucherIds.map(() => '?').join(',')}) AND e.ledger_id <> ?`,
-      [...voucherIds, ledgerId],
-    )
-    : [];
+  // each voucher touching this ledger carries its own lines, so the contra
+  // entries come along without a second query
+  const vouchers = await find('vouchers', {
+    company_id: companyId,
+    is_deleted: 0,
+    date: { $gte: p.from, $lte: p.to },
+    'entries.ledger_id': ledgerId,
+  }, {
+    sort: { date: 1, id: 1 },
+    project: { id: 1, date: 1, voucher_number: 1, narration: 1, is_cancelled: 1, voucher_type_id: 1, entries: 1 },
+  });
+  const [typeNames, ledgerNames] = await Promise.all([
+    namesById('voucher_types', vouchers.map((v) => v.voucher_type_id)),
+    namesById('ledgers', vouchers.flatMap((v) => v.entries.map((e) => e.ledger_id))),
+  ]);
+
+  const rows = [];
   const contraByVoucher = new Map();
-  for (const c of contraRows) {
-    if (!contraByVoucher.has(c.voucher_id)) contraByVoucher.set(c.voucher_id, []);
-    contraByVoucher.get(c.voucher_id).push(c);
+  for (const v of vouchers) {
+    if (!typeNames.has(v.voucher_type_id)) continue;
+    const lines = [...v.entries].sort((a, b) => (a.line_no - b.line_no) || (a.id - b.id));
+    for (const e of lines) {
+      if (e.ledger_id !== ledgerId) continue;
+      rows.push({
+        id: v.id,
+        date: v.date,
+        voucher_number: v.voucher_number,
+        narration: v.narration,
+        is_cancelled: v.is_cancelled,
+        voucher_type_name: typeNames.get(v.voucher_type_id),
+        dr_cr: e.dr_cr,
+        amount: e.amount,
+        entry_id: e.id,
+      });
+    }
+    contraByVoucher.set(v.id, [...v.entries]
+      .sort((a, b) => a.id - b.id)
+      .filter((e) => e.ledger_id !== ledgerId && ledgerNames.has(e.ledger_id))
+      .map((e) => ({ voucher_id: v.id, name: ledgerNames.get(e.ledger_id), dr_cr: e.dr_cr, amount: e.amount })));
   }
 
   let running = bal ? bal.opening : 0;
@@ -435,33 +465,18 @@ export async function ledgerStatement(companyId, ledgerId, q = {}) {
 /** Stock Summary - quantity and value movement per item. */
 export async function stockSummary(companyId, q = {}) {
   const p = await period(companyId, q);
-  const items = await all(
-    `SELECT s.*, g.name AS stock_group_name, u.symbol AS unit_name
-       FROM stock_items s
-       LEFT JOIN stock_groups g ON g.id = s.stock_group_id
-       LEFT JOIN units u ON u.id = s.unit_id
-      WHERE s.company_id = ? ORDER BY s.name COLLATE NOCASE`,
-    [companyId],
-  );
-
-  const fetch = (op, date) => all(
-    `SELECT i.stock_item_id, i.direction, SUM(i.quantity) AS qty, SUM(i.amount) AS amt
-       FROM voucher_inventory i JOIN vouchers v ON v.id = i.voucher_id
-      WHERE v.company_id = ? AND v.is_deleted = 0 AND v.is_cancelled = 0 AND v.is_optional = 0
-        AND v.date ${op} ?
-      GROUP BY i.stock_item_id, i.direction`,
-    [companyId, date],
-  );
-
-  const inPeriod = await all(
-    `SELECT i.stock_item_id, i.direction, SUM(i.quantity) AS qty, SUM(i.amount) AS amt
-       FROM voucher_inventory i JOIN vouchers v ON v.id = i.voucher_id
-      WHERE v.company_id = ? AND v.is_deleted = 0 AND v.is_cancelled = 0 AND v.is_optional = 0
-        AND v.date >= ? AND v.date <= ?
-      GROUP BY i.stock_item_id, i.direction`,
-    [companyId, p.from, p.to],
-  );
-  const before = await fetch('<', p.from);
+  const itemRows = await find('stock_items', { company_id: companyId }, { sort: { name: 1 } });
+  const [groupNames, unitNames, inPeriod, before] = await Promise.all([
+    namesById('stock_groups', itemRows.map((it) => it.stock_group_id)),
+    namesById('units', itemRows.map((it) => it.unit_id), 'symbol'),
+    inventoryTotals({ ...posted(companyId), date: { $gte: p.from, $lte: p.to } }),
+    inventoryTotals({ ...posted(companyId), date: { $lt: p.from } }),
+  ]);
+  const items = itemRows.map((it) => ({
+    ...it,
+    stock_group_name: groupNames.get(it.stock_group_id) ?? null,
+    unit_name: unitNames.get(it.unit_id) ?? null,
+  }));
 
   const agg = (rows) => {
     const m = new Map();
@@ -521,19 +536,37 @@ export async function stockSummary(companyId, q = {}) {
 export async function outstandings(companyId, kind = 'receivable', q = {}) {
   const p = await period(companyId, q);
   const groupName = kind === 'payable' ? 'Sundry Creditors' : 'Sundry Debtors';
-  const rows = await all(
-    `SELECT b.*, l.name AS ledger_name, v.date, v.id AS voucher_id,
-            vt.name AS voucher_type_name, g.name AS group_name
-       FROM bill_allocations b
-       JOIN vouchers v ON v.id = b.voucher_id
-       JOIN voucher_types vt ON vt.id = v.voucher_type_id
-       JOIN ledgers l ON l.id = b.ledger_id
-       JOIN groups g ON g.id = l.group_id
-      WHERE v.company_id = ? AND v.is_deleted = 0 AND v.is_cancelled = 0
-        AND v.date <= ? AND g.name = ?
-      ORDER BY l.name, v.date`,
-    [companyId, p.to, groupName],
-  );
+  // ledgers sitting directly under the group, in name order
+  const groups = await find('groups', { company_id: companyId, name: groupName }, { project: { id: 1 } });
+  const ledgers = await find('ledgers', {
+    company_id: companyId, group_id: { $in: groups.map((g) => g.id) },
+  }, { sort: { name: 1 }, project: { id: 1, name: 1 } });
+  const ledgerRank = new Map(ledgers.map((l, i) => [l.id, i]));
+  const ledgerName = new Map(ledgers.map((l) => [l.id, l.name]));
+
+  const vouchers = await find('vouchers', {
+    company_id: companyId,
+    is_deleted: 0,
+    is_cancelled: 0,
+    date: { $lte: p.to },
+    'bills.ledger_id': { $in: ledgers.map((l) => l.id) },
+  }, { project: { id: 1, date: 1, voucher_type_id: 1, bills: 1 } });
+  const typeNames = await namesById('voucher_types', vouchers.map((v) => v.voucher_type_id));
+
+  const rows = vouchers
+    .filter((v) => typeNames.has(v.voucher_type_id))
+    .flatMap((v) => v.bills
+      .filter((b) => ledgerRank.has(b.ledger_id))
+      .map((b) => ({
+        ...b,
+        voucher_id: v.id,
+        ledger_name: ledgerName.get(b.ledger_id),
+        date: v.date,
+        voucher_type_name: typeNames.get(v.voucher_type_id),
+        group_name: groupName,
+      })))
+    .sort((a, b) => (ledgerRank.get(a.ledger_id) - ledgerRank.get(b.ledger_id))
+      || a.date.localeCompare(b.date) || (a.voucher_id - b.voucher_id) || (a.id - b.id));
 
   const byBill = new Map();
   for (const r of rows) {
@@ -668,26 +701,20 @@ export async function dashboard(companyId, q = {}) {
   const p = await period(companyId, q);
   const pl = await profitAndLoss(companyId, q);
   const bs = await balanceSheet(companyId, q);
-  const counts = await get(
-    `SELECT COUNT(*) AS vouchers,
-            SUM(CASE WHEN is_deleted = 1 THEN 1 ELSE 0 END) AS deleted,
-            SUM(CASE WHEN is_cancelled = 1 THEN 1 ELSE 0 END) AS cancelled
-       FROM vouchers WHERE company_id = ?`,
-    [companyId],
-  ) || {};
-  const edits = await get(
-    `SELECT COUNT(*) AS total,
-            SUM(CASE WHEN action = 'Altered' THEN 1 ELSE 0 END) AS altered
-       FROM edit_log WHERE company_id = ?`,
-    [companyId],
-  ) || {};
+  const [vouchers, deleted, cancelled, editTotal, altered] = await Promise.all([
+    count('vouchers', { company_id: companyId }),
+    count('vouchers', { company_id: companyId, is_deleted: 1 }),
+    count('vouchers', { company_id: companyId, is_cancelled: 1 }),
+    count('edit_log', { company_id: companyId }),
+    count('edit_log', { company_id: companyId, action: 'Altered' }),
+  ]);
   return {
     period: p,
-    vouchers: toNum(counts.vouchers),
-    deletedVouchers: toNum(counts.deleted),
-    cancelledVouchers: toNum(counts.cancelled),
-    editLogEntries: toNum(edits.total),
-    alteredEntries: toNum(edits.altered),
+    vouchers,
+    deletedVouchers: deleted,
+    cancelledVouchers: cancelled,
+    editLogEntries: editTotal,
+    alteredEntries: altered,
     sales: pl.summary.sales,
     purchases: pl.summary.purchases,
     netProfit: pl.summary.netProfit,

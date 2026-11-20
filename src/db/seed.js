@@ -1,4 +1,4 @@
-import { insert, get, all, run } from './index.js';
+import { insert, findOne, exists, update } from './index.js';
 
 /**
  * The 28 groups every new company starts with.
@@ -152,13 +152,13 @@ export async function seedCompanyDefaults(companyId, company) {
 
 /** Ensures at least one administrator exists. */
 export async function seedAdminUser() {
-  const existing = await get('SELECT TOP 1 id FROM users ORDER BY id');
+  const existing = await findOne('users', {}, { sort: { id: 1 }, project: { id: 1 } });
   if (existing) {
     // Databases created before the rename hold the old salt; re-stamp the
     // untouched factory password so signing in still works.
-    const admin = await get("SELECT id, password_hash FROM users WHERE username = 'admin'");
+    const admin = await findOne('users', { username: 'admin' }, { project: { id: 1, password_hash: 1 } });
     if (admin && admin.password_hash === hashPassword('admin', 'tally')) {
-      await run('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword('admin'), admin.id]);
+      await update('users', admin.id, { password_hash: hashPassword('admin') });
     }
     return existing.id;
   }
@@ -187,7 +187,6 @@ export function listDefaultGroupNames() {
   return DEFAULT_GROUPS.map((g) => g.name);
 }
 
-export async function companyHasData(companyId) {
-  const rows = await all('SELECT TOP 1 id FROM vouchers WHERE company_id = ?', [companyId]);
-  return rows.length > 0;
+export function companyHasData(companyId) {
+  return exists('vouchers', { company_id: companyId });
 }

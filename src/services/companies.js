@@ -1,5 +1,5 @@
-import { all, get, insert, update, run, transaction } from '../db/index.js';
-import { COMPANY_CASCADE } from '../db/schema.js';
+import { find, findOne, exists, insert, update, remove, transaction } from '../db/index.js';
+import { COMPANY_COLLECTIONS } from '../db/schema.js';
 import { seedCompanyDefaults } from '../db/seed.js';
 import { logChange } from '../lib/editlog.js';
 import { badRequest, notFound, toNum, toBool, toStr } from '../lib/http.js';
@@ -30,11 +30,11 @@ function coerce(body, existing) {
 }
 
 export function listCompanies() {
-  return all('SELECT * FROM companies ORDER BY name');
+  return find('companies', {}, { sort: { name: 1 } });
 }
 
 export async function getCompany(id) {
-  const row = await get('SELECT * FROM companies WHERE id = ?', [id]);
+  const row = await findOne('companies', { id });
   if (!row) throw notFound('Company not found');
   return row;
 }
@@ -43,7 +43,7 @@ export async function createCompany(body, actor) {
   const data = coerce(body, null);
   if (!toStr(data.name).trim()) throw badRequest('Company name is required');
   data.name = data.name.trim();
-  if (await get('SELECT id FROM companies WHERE name = ?', [data.name])) {
+  if (await exists('companies', { name: data.name })) {
     throw badRequest(`Company "${data.name}" already exists`);
   }
   const fyFrom = data.financial_year_from || defaultFinancialYear();
@@ -115,11 +115,15 @@ export async function deleteCompany(id, actor) {
       after: companySnapshot(row),
       user: actor,
     });
-    for (const statement of COMPANY_CASCADE) {
-      await run(statement, [id]);
-    }
+    await purgeCompany(id);
     return { deleted: true, id };
   });
+}
+
+/** Removes a company and every row that belongs to it. */
+export async function purgeCompany(id) {
+  for (const name of COMPANY_COLLECTIONS) await remove(name, { company_id: id });
+  await remove('companies', { id });
 }
 
 function companySnapshot(row) {

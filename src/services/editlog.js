@@ -1,37 +1,50 @@
-import { all } from '../db/index.js';
-import { hydrate, compareVersions, historyFor } from '../lib/editlog.js';
+import { find, aggregate, contains } from '../db/index.js';
+import { hydrate, parseStored, compareVersions, historyFor } from '../lib/editlog.js';
 import { toNum } from '../lib/http.js';
 import { MASTERS } from './masters.js';
 
+/** A query-string value as a plain string (never an object/operator). */
+const str = (v) => (v == null || typeof v === 'object' ? '' : String(v));
+
+/**
+ * `logged_at` is `yyyy-mm-dd hh:mm:ss`; filtering on its date part is a range
+ * on the full text. The upper bound sorts after any time on the `to` day.
+ */
+function loggedRange(q) {
+  const from = str(q.from);
+  const to = str(q.to);
+  if (!from && !to) return {};
+  const range = {};
+  if (from) range.$gte = from;
+  if (to) range.$lte = `${to} 99:99:99`;
+  return { logged_at: range };
+}
+
 /** Flat Edit Log listing with the filters the report offers. */
 export async function listLog(companyId, q = {}) {
-  const where = ['company_id = ?'];
-  const params = [companyId];
-  if (q.from) { where.push('LEFT(logged_at, 10) >= ?'); params.push(q.from); }
-  if (q.to) { where.push('LEFT(logged_at, 10) <= ?'); params.push(q.to); }
-  if (q.action) { where.push('action = ?'); params.push(q.action); }
-  if (q.kind) { where.push('entity_kind = ?'); params.push(q.kind); }
-  if (q.entityType) { where.push('entity_type = ?'); params.push(q.entityType); }
-  if (q.entityId) { where.push('entity_id = ?'); params.push(toNum(q.entityId)); }
-  if (q.user) { where.push('username = ?'); params.push(q.user); }
-  if (q.voucherType) { where.push('voucher_type = ?'); params.push(q.voucherType); }
-  if (q.search) {
-    where.push('(entity_name LIKE ? OR entity_label LIKE ? OR voucher_number LIKE ? OR username LIKE ?)');
-    const s = `%${q.search}%`;
-    params.push(s, s, s, s);
+  const filter = { company_id: companyId, ...loggedRange(q) };
+  if (str(q.action)) filter.action = str(q.action);
+  if (str(q.kind)) filter.entity_kind = str(q.kind);
+  if (str(q.entityType)) filter.entity_type = str(q.entityType);
+  if (str(q.entityId)) filter.entity_id = toNum(q.entityId);
+  if (str(q.user)) filter.username = str(q.user);
+  if (str(q.voucherType)) filter.voucher_type = str(q.voucherType);
+  if (str(q.search)) {
+    const s = contains(str(q.search));
+    filter.$or = [{ entity_name: s }, { entity_label: s }, { voucher_number: s }, { username: s }];
   }
-  const limit = toNum(q.limit, 500);
   // The list view only needs a summary; full snapshots are fetched per entity.
-  const rows = await all(
-    `SELECT id, entity_type, entity_kind, entity_id, entity_name, entity_label,
-            action, version_no, username, machine, ip_address, logged_at,
-            voucher_date, voucher_type, voucher_number, amount, changes
-       FROM edit_log WHERE ${where.join(' AND ')}
-      ORDER BY logged_at DESC, id DESC LIMIT ?`,
-    [...params, limit],
-  );
+  const rows = await find('edit_log', filter, {
+    sort: { logged_at: -1, id: -1 },
+    limit: toNum(q.limit, 500),
+    project: {
+      id: 1, entity_type: 1, entity_kind: 1, entity_id: 1, entity_name: 1, entity_label: 1,
+      action: 1, version_no: 1, username: 1, machine: 1, ip_address: 1, logged_at: 1,
+      voucher_date: 1, voucher_type: 1, voucher_number: 1, amount: 1, changes: 1,
+    },
+  });
   return rows.map((r) => {
-    const changes = safeParse(r.changes, []);
+    const changes = parseStored(r.changes, []);
     const { changes: _drop, ...rest } = r;
     return {
       ...rest,
@@ -41,34 +54,27 @@ export async function listLog(companyId, q = {}) {
   });
 }
 
-function safeParse(s, fallback) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return fallback;
-  }
-}
-
 /**
  * Edit Log Summary - one row per voucher type / master type with the number of
  * entities created, altered, deleted and the total version count.
  */
 export async function summary(companyId, q = {}) {
-  const where = ['company_id = ?'];
-  const params = [companyId];
-  if (q.from) { where.push('LEFT(logged_at, 10) >= ?'); params.push(q.from); }
-  if (q.to) { where.push('LEFT(logged_at, 10) <= ?'); params.push(q.to); }
-
-  const rows = await all(
-    `SELECT entity_kind, entity_type,
-            CASE WHEN entity_kind = 'Voucher' THEN voucher_type ELSE entity_type END AS bucket,
-            action, COUNT(*) AS events, COUNT(DISTINCT entity_id) AS entities
-       FROM edit_log WHERE ${where.join(' AND ')}
-      GROUP BY entity_kind, entity_type,
-               CASE WHEN entity_kind = 'Voucher' THEN voucher_type ELSE entity_type END,
-               action`,
-    params,
-  );
+  const groups = await aggregate('edit_log', [
+    { $match: { company_id: companyId, ...loggedRange(q) } },
+    {
+      $group: {
+        _id: {
+          entity_kind: '$entity_kind',
+          entity_type: '$entity_type',
+          bucket: { $cond: [{ $eq: ['$entity_kind', 'Voucher'] }, '$voucher_type', '$entity_type'] },
+          action: '$action',
+        },
+        events: { $sum: 1 },
+        ids: { $addToSet: '$entity_id' },
+      },
+    },
+  ]);
+  const rows = groups.map((g) => ({ ...g._id, events: g.events, entities: g.ids.length }));
 
   const map = new Map();
   for (const r of rows) {
@@ -118,55 +124,60 @@ export async function summary(companyId, q = {}) {
  * drill-down target of the Edit Log Summary.
  */
 export async function entities(companyId, q = {}) {
-  const where = ['company_id = ?'];
-  const params = [companyId];
-  if (q.kind) { where.push('entity_kind = ?'); params.push(q.kind); }
-  if (q.entityType) { where.push('entity_type = ?'); params.push(q.entityType); }
-  if (q.voucherType) { where.push('voucher_type = ?'); params.push(q.voucherType); }
-  if (q.from) { where.push('LEFT(logged_at, 10) >= ?'); params.push(q.from); }
-  if (q.to) { where.push('LEFT(logged_at, 10) <= ?'); params.push(q.to); }
-  if (q.onlyAltered) where.push("entity_id IN (SELECT entity_id FROM edit_log WHERE action = 'Altered')");
+  const match = { company_id: companyId, ...loggedRange(q) };
+  if (str(q.kind)) match.entity_kind = str(q.kind);
+  if (str(q.entityType)) match.entity_type = str(q.entityType);
+  if (str(q.voucherType)) match.voucher_type = str(q.voucherType);
 
-  const rows = await all(
-    `SELECT entity_kind, entity_type, entity_id,
-            MAX(entity_label) AS entity_label,
-            MAX(entity_name) AS entity_name,
-            MAX(voucher_type) AS voucher_type,
-            MAX(voucher_number) AS voucher_number,
-            MAX(voucher_date) AS voucher_date,
-            MAX(amount) AS amount,
-            COUNT(*) AS versions,
-            MIN(logged_at) AS first_at,
-            MAX(logged_at) AS last_at,
-            SUM(CASE WHEN action = 'Altered' THEN 1 ELSE 0 END) AS alterations,
-            SUM(CASE WHEN action = 'Deleted' THEN 1 ELSE 0 END) AS deletions,
-            SUM(CASE WHEN action = 'Cancelled' THEN 1 ELSE 0 END) AS cancellations
-       FROM edit_log WHERE ${where.join(' AND ')}
-      GROUP BY entity_kind, entity_type, entity_id
-      ORDER BY MAX(logged_at) DESC
-      LIMIT ?`,
-    [...params, toNum(q.limit, 400)],
-  );
+  const pipeline = [
+    { $match: match },
+    {
+      $group: {
+        _id: { entity_kind: '$entity_kind', entity_type: '$entity_type', entity_id: '$entity_id' },
+        entity_label: { $max: '$entity_label' },
+        entity_name: { $max: '$entity_name' },
+        voucher_type: { $max: '$voucher_type' },
+        voucher_number: { $max: '$voucher_number' },
+        voucher_date: { $max: '$voucher_date' },
+        amount: { $max: '$amount' },
+        versions: { $sum: 1 },
+        first_at: { $min: '$logged_at' },
+        last_at: { $max: '$logged_at' },
+        alterations: { $sum: { $cond: [{ $eq: ['$action', 'Altered'] }, 1, 0] } },
+        deletions: { $sum: { $cond: [{ $eq: ['$action', 'Deleted'] }, 1, 0] } },
+        cancellations: { $sum: { $cond: [{ $eq: ['$action', 'Cancelled'] }, 1, 0] } },
+        last_log_id: { $max: '$id' },
+      },
+    },
+    // timestamps have one-second resolution; the latest log entry breaks ties
+    { $sort: { last_at: -1, last_log_id: -1 } },
+  ];
+  let rows = (await aggregate('edit_log', pipeline))
+    .map(({ _id, last_log_id: _tie, ...r }) => ({ ..._id, ...r }));
 
-  // the latest action for every entity in a single pass
-  const latest = await all(
-    `SELECT e.entity_type, e.entity_id, e.action, e.username
-       FROM edit_log e
-       JOIN (
-         SELECT entity_type, entity_id, MAX(id) AS mx
-           FROM edit_log WHERE company_id = ?
-          GROUP BY entity_type, entity_id
-       ) m ON m.entity_type = e.entity_type AND m.entity_id = e.entity_id AND m.mx = e.id`,
-    [companyId],
-  );
-  const lastByEntity = new Map(
-    latest.map((r) => [`${r.entity_type}:${r.entity_id}`, { action: r.action, username: r.username }]),
-  );
+  // the latest action for every entity, and which entities were ever altered
+  const latest = await aggregate('edit_log', [
+    { $match: { company_id: companyId } },
+    { $sort: { id: -1 } },
+    {
+      $group: {
+        _id: { entity_type: '$entity_type', entity_id: '$entity_id' },
+        action: { $first: '$action' },
+        username: { $first: '$username' },
+        altered: { $max: { $cond: [{ $eq: ['$action', 'Altered'] }, 1, 0] } },
+      },
+    },
+  ]);
+  const byEntity = new Map(latest.map((r) => [`${r._id.entity_type}:${r._id.entity_id}`, r]));
 
-  return rows.map((r) => ({
-    ...r,
-    lastAction: lastByEntity.get(`${r.entity_type}:${r.entity_id}`) || null,
-  }));
+  if (str(q.onlyAltered)) {
+    rows = rows.filter((r) => byEntity.get(`${r.entity_type}:${r.entity_id}`)?.altered);
+  }
+
+  return rows.slice(0, toNum(q.limit, 400)).map((r) => {
+    const last = byEntity.get(`${r.entity_type}:${r.entity_id}`);
+    return { ...r, lastAction: last ? { action: last.action, username: last.username } : null };
+  });
 }
 
 /** Full version history plus a diff against the previous version. */
@@ -184,10 +195,12 @@ export function compare(companyId, entityType, entityId, a, b) {
 
 /** Distinct users that appear in the log, for the filter bar. */
 export async function logUsers(companyId) {
-  return all(
-    'SELECT username, COUNT(*) AS events FROM edit_log WHERE company_id = ? GROUP BY username ORDER BY username',
-    [companyId],
-  );
+  const rows = await aggregate('edit_log', [
+    { $match: { company_id: companyId } },
+    { $group: { _id: '$username', events: { $sum: 1 } } },
+    { $sort: { _id: 1 } },
+  ]);
+  return rows.map((r) => ({ username: r._id, events: r.events }));
 }
 
 function titleise(s) {

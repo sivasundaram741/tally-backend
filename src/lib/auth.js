@@ -1,12 +1,12 @@
 import crypto from 'node:crypto';
-import { get, insert, run, all } from '../db/index.js';
+import { findOne, find, insert, remove, exists } from '../db/index.js';
 import { hashPassword } from '../db/seed.js';
 import { unauthorized, badRequest } from './http.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
 export async function login(username, password) {
-  const user = await get('SELECT * FROM users WHERE username = ? AND is_active = 1', [username]);
+  const user = await findOne('users', { username: String(username ?? ''), is_active: 1 });
   if (!user || user.password_hash !== hashPassword(password)) {
     throw unauthorized('Invalid user name or password');
   }
@@ -20,12 +20,15 @@ export async function login(username, password) {
 }
 
 export async function logout(token) {
-  if (token) await run('DELETE FROM sessions WHERE token = ?', [token]);
+  if (token) await remove('sessions', { token });
 }
 
-export async function createUser({ username, password, full_name, security_level }) {
+export async function createUser(body) {
+  // plain strings only: an object here could act as a query operator
+  const [username, password, full_name, security_level] = ['username', 'password', 'full_name', 'security_level']
+    .map((k) => (body?.[k] == null || typeof body[k] === 'object' ? '' : String(body[k])));
   if (!username || !password) throw badRequest('User name and password are required');
-  if (await get('SELECT id FROM users WHERE username = ?', [username])) {
+  if (await exists('users', { username })) {
     throw badRequest('That user name already exists');
   }
   const id = await insert('users', {
@@ -34,11 +37,14 @@ export async function createUser({ username, password, full_name, security_level
     password_hash: hashPassword(password),
     security_level: security_level || 'Data Entry',
   });
-  return publicUser(await get('SELECT * FROM users WHERE id = ?', [id]));
+  return publicUser(await findOne('users', { id }));
 }
 
 export async function listUsers() {
-  return all('SELECT id, username, full_name, security_level, is_active, created_at FROM users ORDER BY id');
+  return find('users', {}, {
+    sort: { id: 1 },
+    project: { id: 1, username: 1, full_name: 1, security_level: 1, is_active: 1, created_at: 1 },
+  });
 }
 
 export function publicUser(u) {
@@ -60,12 +66,12 @@ export async function currentUser(req) {
   const token = req.get('x-auth-token') || '';
   let user = null;
   if (token) {
-    const session = await get('SELECT * FROM sessions WHERE token = ?', [token]);
+    const session = await findOne('sessions', { token });
     if (session && new Date(session.expires_at) > new Date()) {
-      user = await get('SELECT * FROM users WHERE id = ?', [session.user_id]);
+      user = await findOne('users', { id: session.user_id });
     }
   }
-  if (!user) user = await get("SELECT * FROM users WHERE username = 'admin'");
+  if (!user) user = await findOne('users', { username: 'admin' });
   return {
     id: user?.id ?? null,
     username: user?.username || 'admin',

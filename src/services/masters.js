@@ -1,4 +1,6 @@
-import { all, get, insert, update, run, transaction } from '../db/index.js';
+import {
+  find, findOne, exists, count, insert, update, remove, transaction, contains,
+} from '../db/index.js';
 import { logChange, historyFor } from '../lib/editlog.js';
 import { badRequest, notFound, conflict, toNum, toBool, toStr } from '../lib/http.js';
 
@@ -205,28 +207,47 @@ export const MASTERS = {
   },
 };
 
-/** Tables that reference a master, used to block deletion of masters in use. */
+/**
+ * What references each master, used to block deletion of masters in use (the
+ * job SQL Server's foreign keys used to do). Voucher lines live inside the
+ * voucher, so those references are counted per voucher.
+ */
 const USAGE = {
   groups: [
     ['ledgers', 'group_id', 'ledger'],
     ['groups', 'parent_id', 'group'],
   ],
   ledgers: [
-    ['voucher_entries', 'ledger_id', 'voucher entry'],
+    ['vouchers', 'entries.ledger_id', 'voucher'],
     ['vouchers', 'party_ledger_id', 'voucher'],
-    ['bill_allocations', 'ledger_id', 'bill reference'],
+    ['vouchers', 'bills.ledger_id', 'voucher bill reference'],
   ],
-  stock_items: [['voucher_inventory', 'stock_item_id', 'voucher']],
-  units: [['stock_items', 'unit_id', 'stock item']],
-  godowns: [['voucher_inventory', 'godown_id', 'voucher']],
+  stock_items: [['vouchers', 'inventory.stock_item_id', 'voucher']],
+  units: [
+    ['stock_items', 'unit_id', 'stock item'],
+    ['units', 'base_unit_id', 'compound unit'],
+    ['units', 'additional_unit_id', 'compound unit'],
+    ['vouchers', 'inventory.unit_id', 'voucher'],
+  ],
+  godowns: [
+    ['vouchers', 'inventory.godown_id', 'voucher'],
+    ['godowns', 'parent_id', 'godown'],
+  ],
   stock_groups: [
     ['stock_items', 'stock_group_id', 'stock item'],
     ['stock_groups', 'parent_id', 'stock group'],
   ],
-  stock_categories: [['stock_items', 'category_id', 'stock item']],
+  stock_categories: [
+    ['stock_items', 'category_id', 'stock item'],
+    ['stock_categories', 'parent_id', 'stock category'],
+  ],
   voucher_types: [['vouchers', 'voucher_type_id', 'voucher']],
-  cost_centres: [['voucher_entries', 'cost_centre_id', 'voucher entry']],
+  cost_centres: [
+    ['vouchers', 'entries.cost_centre_id', 'voucher'],
+    ['cost_centres', 'parent_id', 'cost centre'],
+  ],
   cost_categories: [['cost_centres', 'category_id', 'cost centre']],
+  budgets: [['budgets', 'parent_id', 'budget']],
 };
 
 export function def(key) {
@@ -268,11 +289,8 @@ async function refNameMaps(d, rows) {
     maps[key] ||= new Map();
     const missing = ids.filter((id) => !maps[key].has(Number(id)));
     if (!missing.length) continue;
-    const found = await all(
-      `SELECT id, ${f.nameCol} AS n FROM ${f.table} WHERE id IN (${missing.map(() => '?').join(',')})`,
-      missing,
-    );
-    for (const row of found) maps[key].set(Number(row.id), row.n);
+    const found = await find(f.table, { id: { $in: missing } }, { project: { id: 1, [f.nameCol]: 1 } });
+    for (const row of found) maps[key].set(Number(row.id), row[f.nameCol]);
   }
   return maps;
 }
@@ -314,42 +332,29 @@ export async function decorate(d, row) {
 
 export async function listMasters(key, companyId, { search = '', includeInactive = false } = {}) {
   const d = def(key);
-  const where = ['company_id = ?'];
-  const params = [companyId];
-  if (!includeInactive) where.push('is_inactive = 0');
-  if (search) {
-    where.push(`${d.nameCol} LIKE ?`);
-    params.push(`%${search}%`);
-  }
-  const rows = await all(
-    `SELECT * FROM ${d.table} WHERE ${where.join(' AND ')} ORDER BY ${d.nameCol}`,
-    params,
-  );
+  const filter = { company_id: companyId };
+  if (!includeInactive) filter.is_inactive = 0;
+  if (search && typeof search === 'string') filter[d.nameCol] = contains(search);
+  const rows = await find(d.table, filter, { sort: { [d.nameCol]: 1 } });
   const maps = await refNameMaps(d, rows);
   return rows.map((row) => decorateWith(d, row, maps));
 }
 
 export async function getMaster(key, companyId, id) {
   const d = def(key);
-  const row = await get(`SELECT * FROM ${d.table} WHERE id = ? AND company_id = ?`, [id, companyId]);
+  const row = await findOne(d.table, { id, company_id: companyId });
   if (!row) throw notFound(`${d.label} not found`);
   return decorate(d, row);
 }
 
 export async function findByName(key, companyId, name) {
   const d = def(key);
-  const row = await get(
-    `SELECT * FROM ${d.table} WHERE company_id = ? AND ${d.nameCol} = ?`,
-    [companyId, name],
-  );
+  const row = await findOne(d.table, { company_id: companyId, [d.nameCol]: String(name) });
   return row ? decorate(d, row) : null;
 }
 
 async function assertUniqueName(d, companyId, name, excludeId) {
-  const row = await get(
-    `SELECT id FROM ${d.table} WHERE company_id = ? AND ${d.nameCol} = ?`,
-    [companyId, name],
-  );
+  const row = await findOne(d.table, { company_id: companyId, [d.nameCol]: name }, { project: { id: 1 } });
   if (row && row.id !== excludeId) {
     throw conflict(`${d.label} "${name}" already exists`);
   }
@@ -363,8 +368,21 @@ async function assertNoCycle(d, id, parentId) {
     if (cur === id) throw badRequest('A master cannot be placed under itself');
     if (seen.has(cur)) break;
     seen.add(cur);
-    const row = await get(`SELECT ${d.parentCol} AS p FROM ${d.table} WHERE id = ?`, [cur]);
-    cur = row ? row.p : null;
+    const row = await findOne(d.table, { id: cur }, { project: { [d.parentCol]: 1 } });
+    cur = row ? row[d.parentCol] : null;
+  }
+}
+
+/**
+ * Every reference must point at an existing record of the same company -
+ * what SQL Server's foreign keys used to guarantee.
+ */
+async function assertRefs(d, companyId, data) {
+  for (const f of d.fields) {
+    if (f.kind !== 'r' || data[f.col] == null) continue;
+    if (!(await exists(f.table, { id: data[f.col], company_id: companyId }))) {
+      throw badRequest('That reference does not exist. Pick an existing record from the list.', { field: f.col });
+    }
   }
 }
 
@@ -375,10 +393,11 @@ export async function createMaster(key, companyId, body, actor) {
   if (!name) throw badRequest(`${d.label} name is required`);
   data[d.nameCol] = name;
   await assertUniqueName(d, companyId, name);
+  await assertRefs(d, companyId, data);
 
   return transaction(async () => {
     const id = await insert(d.table, { ...data, company_id: companyId });
-    const row = await get(`SELECT * FROM ${d.table} WHERE id = ?`, [id]);
+    const row = await findOne(d.table, { id });
     await logChange({
       companyId,
       entityType: key,
@@ -397,7 +416,7 @@ export async function createMaster(key, companyId, body, actor) {
 
 export async function updateMaster(key, companyId, id, body, actor) {
   const d = def(key);
-  const row = await get(`SELECT * FROM ${d.table} WHERE id = ? AND company_id = ?`, [id, companyId]);
+  const row = await findOne(d.table, { id, company_id: companyId });
   if (!row) throw notFound(`${d.label} not found`);
 
   const data = coerce(d, body, row);
@@ -410,6 +429,7 @@ export async function updateMaster(key, companyId, id, body, actor) {
   if (d.parentCol && data[d.parentCol] !== undefined) {
     await assertNoCycle(d, id, data[d.parentCol]);
   }
+  await assertRefs(d, companyId, data);
   if (row.is_reserved && data[d.nameCol] && data[d.nameCol] !== row[d.nameCol]) {
     throw badRequest(`"${row[d.nameCol]}" is a reserved ${d.label.toLowerCase()} and cannot be renamed`);
   }
@@ -417,7 +437,7 @@ export async function updateMaster(key, companyId, id, body, actor) {
   const before = await snapshot(d, row);
   return transaction(async () => {
     await update(d.table, id, data);
-    const after = await get(`SELECT * FROM ${d.table} WHERE id = ?`, [id]);
+    const after = await findOne(d.table, { id });
     await logChange({
       companyId,
       entityType: key,
@@ -436,15 +456,15 @@ export async function updateMaster(key, companyId, id, body, actor) {
 
 export async function deleteMaster(key, companyId, id, actor) {
   const d = def(key);
-  const row = await get(`SELECT * FROM ${d.table} WHERE id = ? AND company_id = ?`, [id, companyId]);
+  const row = await findOne(d.table, { id, company_id: companyId });
   if (!row) throw notFound(`${d.label} not found`);
   if (row.is_reserved) {
     throw badRequest(`"${row[d.nameCol]}" is a reserved ${d.label.toLowerCase()} and cannot be deleted`);
   }
-  for (const [table, col, what] of USAGE[d.table] || []) {
-    const used = await get(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = ?`, [id]);
-    if (used && used.c > 0) {
-      throw conflict(`Cannot delete - this ${d.label.toLowerCase()} is used by ${used.c} ${what}(s)`);
+  for (const [table, field, what] of USAGE[d.table] || []) {
+    const used = await count(table, { company_id: companyId, [field]: id });
+    if (used > 0) {
+      throw conflict(`Cannot delete - this ${d.label.toLowerCase()} is used by ${used} ${what}(s)`);
     }
   }
 
@@ -462,7 +482,7 @@ export async function deleteMaster(key, companyId, id, actor) {
       after: before,
       user: actor,
     });
-    await run(`DELETE FROM ${d.table} WHERE id = ?`, [id]);
+    await remove(d.table, { id });
     return { deleted: true, id };
   });
 }
@@ -475,8 +495,7 @@ export function masterHistory(key, companyId, id) {
 export async function masterCounts(companyId) {
   const counts = {};
   for (const [key, d] of Object.entries(MASTERS)) {
-    const row = await get(`SELECT COUNT(*) AS c FROM ${d.table} WHERE company_id = ?`, [companyId]);
-    counts[key] = row ? row.c : 0;
+    counts[key] = await count(d.table, { company_id: companyId });
   }
   return counts;
 }

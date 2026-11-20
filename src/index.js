@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { migrate, dbLabel, close } from './db/index.js';
+import { migrate, dbLabel, close, supportsTransactions } from './db/index.js';
 import { seedAdminUser } from './db/seed.js';
 import { attachUser } from './lib/auth.js';
 import { ApiError, translateDbError } from './lib/http.js';
@@ -23,7 +23,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(attachUser);
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', product: APP_NAME, engine: 'SQL Server', database: dbLabel() });
+  res.json({ status: 'ok', product: APP_NAME, engine: 'MongoDB', database: dbLabel() });
 });
 
 app.use('/api/auth', auth);
@@ -55,16 +55,15 @@ async function start() {
     await migrate();
     await seedAdminUser();
   } catch (err) {
-    console.error('\nCould not reach SQL Server.');
+    console.error('\nCould not reach MongoDB.');
     console.error(`  ${err.message}`);
-    console.error('\nCheck backend/.env, and that the SQL Browser service is running');
-    console.error('for a named instance (or set SQLSERVER_PORT).\n');
+    console.error('\nCheck MONGODB_URI in backend/.env and that the MongoDB service is running.\n');
     process.exit(1);
   }
 
   const server = app.listen(PORT, () => {
     console.log(`${APP_NAME} API listening on http://localhost:${PORT}`);
-    console.log(`Database: ${dbLabel()}`);
+    console.log(`Database: ${dbLabel()}${supportsTransactions() ? '' : ' (standalone - writes use rollback-on-error)'}`);
   });
 
   const shutdown = async () => {

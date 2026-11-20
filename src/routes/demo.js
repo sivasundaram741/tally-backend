@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { wrap, badRequest } from '../lib/http.js';
-import { get } from '../db/index.js';
+import { exists } from '../db/index.js';
 import { createCompany } from '../services/companies.js';
 import { createMaster, findByName, updateMaster } from '../services/masters.js';
 import { createVoucher, updateVoucher, deleteVoucher, cancelVoucher } from '../services/vouchers.js';
@@ -13,7 +13,8 @@ const router = Router();
  */
 router.post('/seed', wrap(async (req, res) => {
   const name = req.body?.name || 'Acme Traders Pvt Ltd';
-  if (get('SELECT id FROM companies WHERE name = ? COLLATE NOCASE', [name])) {
+  // the companies collection is case-insensitive, like the old NOCASE match
+  if (await exists('companies', { name })) {
     throw badRequest(`Company "${name}" already exists`);
   }
   const actor = req.actor;

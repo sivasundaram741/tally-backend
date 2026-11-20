@@ -1,4 +1,9 @@
-import { all, get, insert, run, transaction } from '../db/index.js';
+import {
+  find, findOne, exists, insertMany, updateWhere, transaction, nextIds, buildChildren,
+  namesById, runCommand, syncCounters,
+} from '../db/index.js';
+import { COLLECTIONS, CHILD_TABLES } from '../db/schema.js';
+import { parseStored } from '../lib/editlog.js';
 import { MASTERS, createMaster } from './masters.js';
 import { createVoucher } from './vouchers.js';
 import { getCompany, createCompany } from './companies.js';
@@ -35,8 +40,12 @@ const TABLES = [
   { table: 'vouchers', refs: { voucher_type_id: 'voucher_types', party_ledger_id: 'ledgers' } },
 ];
 
-/** Child tables keyed off a voucher rather than the company. */
-const CHILD_TABLES = [
+/**
+ * Voucher lines. MongoDB keeps them inside each voucher; a backup lists them
+ * as separate tables, exactly as SQL Server stored them, so backups made
+ * before and after the move to MongoDB are interchangeable.
+ */
+const LINE_TABLES = [
   {
     table: 'voucher_entries',
     parent: 'voucher_id',
@@ -69,18 +78,25 @@ export async function backupCompany(companyId) {
   const company = await getCompany(companyId);
   const data = {};
   for (const { table } of TABLES) {
-    data[table] = await all(`SELECT * FROM ${table} WHERE company_id = ?`, [companyId]);
+    data[table] = await find(table, { company_id: companyId }, { sort: { id: 1 } });
   }
-  const voucherIds = data.vouchers.map((v) => v.id);
-  for (const { table, parent } of CHILD_TABLES) {
-    data[table] = voucherIds.length
-      ? await all(
-        `SELECT * FROM ${table} WHERE ${parent} IN (${voucherIds.map(() => '?').join(',')})`,
-        voucherIds,
-      )
-      : [];
+
+  // lay the embedded voucher lines out as the tables a backup has always had
+  const vouchers = data.vouchers;
+  data.vouchers = vouchers.map(({ entries, inventory, bills, ...header }) => header);
+  for (const { table } of LINE_TABLES) {
+    const kind = CHILD_TABLES[table];
+    data[table] = vouchers
+      .flatMap((v) => v[kind].map(({ id, ...line }) => (
+        kind === 'bills'
+          ? { id, entry_id: line.entry_id, voucher_id: v.id, ...line }
+          : { id, voucher_id: v.id, ...line })))
+      .sort((a, b) => a.id - b.id);
   }
-  data.edit_log = await all('SELECT * FROM edit_log WHERE company_id = ?', [companyId]);
+
+  // the backup format keeps snapshots as JSON text, as SQL Server stored them
+  data.edit_log = (await find('edit_log', { company_id: companyId }, { sort: { id: 1 } }))
+    .map((r) => ({ ...r, snapshot: JSON.stringify(r.snapshot ?? {}), changes: JSON.stringify(r.changes ?? []) }));
 
   return {
     format: 'ledgertrail.backup',
@@ -106,8 +122,8 @@ export async function restoreCompany(dump, { name } = {}) {
   return transaction(async () => {
     const wanted = (name || src.name || 'Restored Company').trim();
     const finalName = await uniqueCompanyName(wanted);
-    const { id: _ignored, ...companyFields } = src;
-    const companyId = await insert('companies', { ...companyFields, name: finalName });
+    const { id: _ignored, financial_year_to: _derived, ...companyFields } = src;
+    const [companyId] = await insertMany('companies', [{ ...companyFields, name: finalName }]);
 
     const maps = {};
     const put = (table, oldId, newId) => {
@@ -117,56 +133,97 @@ export async function restoreCompany(dump, { name } = {}) {
       if (oldId === null || oldId === undefined || oldId === '') return null;
       return maps[table]?.get(Number(oldId)) ?? null;
     };
+    const remap = (row, refs) => {
+      const out = { ...row };
+      for (const [col, target] of Object.entries(refs || {})) out[col] = look(target, row[col]);
+      return out;
+    };
 
     const d = dump.data || {};
 
     for (const spec of TABLES) {
+      if (spec.table === 'vouchers') continue; // below, once their lines are ready
       const rows = d[spec.table] || [];
       const selfCols = spec.selfMany || (spec.self ? [spec.self] : []);
-      for (const row of rows) {
-        const { id: oldId, ...rest } = row;
-        const payload = { ...rest, company_id: companyId };
+      const payloads = rows.map(({ id: _old, ...rest }) => {
+        const payload = remap({ ...rest, company_id: companyId }, spec.refs);
         for (const col of selfCols) payload[col] = null;
-        for (const [col, target] of Object.entries(spec.refs || {})) {
-          payload[col] = look(target, row[col]);
-        }
-        put(spec.table, oldId, await insert(spec.table, payload));
-      }
+        return payload;
+      });
+      const ids = await insertMany(spec.table, payloads);
+      rows.forEach((row, i) => put(spec.table, row.id, ids[i]));
+
       // second pass for self references, now that every row has an id
       for (const col of selfCols) {
         for (const row of rows) {
           if (row[col] === null || row[col] === undefined) continue;
           const newId = look(spec.table, row.id);
           const newParent = look(spec.table, row[col]);
-          if (newId && newParent) {
-            await run(`UPDATE ${spec.table} SET ${col} = ? WHERE id = ?`, [newParent, newId]);
-          }
+          if (newId && newParent) await updateWhere(spec.table, { id: newId }, { [col]: newParent });
         }
       }
     }
 
-    for (const spec of CHILD_TABLES) {
-      for (const row of d[spec.table] || []) {
-        const { id: oldId, ...rest } = row;
-        const payload = { ...rest };
-        for (const [col, target] of Object.entries(spec.refs || {})) {
-          payload[col] = look(target, row[col]);
-        }
-        if (!payload[spec.parent]) continue;
-        put(spec.table, oldId, await insert(spec.table, payload));
+    // voucher lines, grouped under the voucher they belong to
+    const voucherIds = new Set((d.vouchers || []).map((v) => Number(v.id)));
+    const linesOf = (table) => {
+      const byVoucher = new Map();
+      for (const row of d[table] || []) {
+        if (!voucherIds.has(Number(row.voucher_id))) continue;
+        if (!byVoucher.has(Number(row.voucher_id))) byVoucher.set(Number(row.voucher_id), []);
+        byVoucher.get(Number(row.voucher_id)).push(row);
       }
+      return byVoucher;
+    };
+    const lineSpec = Object.fromEntries(LINE_TABLES.map((t) => [t.table, t.refs]));
+    const entryRows = linesOf('voucher_entries');
+    const inventoryRows = linesOf('voucher_inventory');
+    const billRows = linesOf('bill_allocations');
+
+    // entries get their new ids up front so bill allocations can point at them
+    const entryTotal = [...entryRows.values()].reduce((n, list) => n + list.length, 0);
+    let nextEntryId = entryTotal ? await nextIds('voucher_entries', entryTotal) : 0;
+    for (const list of entryRows.values()) {
+      for (const row of list) put('voucher_entries', row.id, nextEntryId++);
     }
 
-    for (const row of d.edit_log || []) {
-      const { id: _old, ...rest } = row;
-      const target = tableForEntityType(row.entity_type);
-      const mapped = target ? look(target, row.entity_id) : companyId;
-      await insert('edit_log', {
-        ...rest,
-        company_id: companyId,
-        entity_id: mapped ?? row.entity_id,
+    const lineFields = (row, refs, extra = {}) => {
+      const { id: _old, voucher_id: _v, ...rest } = remap(row, refs);
+      return { ...rest, ...extra };
+    };
+
+    const voucherRows = d.vouchers || [];
+    const voucherDocs = [];
+    for (const row of voucherRows) {
+      const oldId = Number(row.id);
+      const { id: _old, entries: _e, inventory: _i, bills: _b, ...header } = row;
+      voucherDocs.push({
+        ...remap({ ...header, company_id: companyId }, TABLES.find((t) => t.table === 'vouchers').refs),
+        entries: await buildChildren('entries', (entryRows.get(oldId) || []).map((e) => ({
+          ...lineFields(e, lineSpec.voucher_entries),
+          id: look('voucher_entries', e.id),
+        }))),
+        inventory: await buildChildren('inventory', (inventoryRows.get(oldId) || [])
+          .map((i) => lineFields(i, lineSpec.voucher_inventory))),
+        bills: await buildChildren('bills', (billRows.get(oldId) || [])
+          .map((b) => lineFields(b, lineSpec.bill_allocations))),
       });
     }
+    const newVoucherIds = await insertMany('vouchers', voucherDocs);
+    voucherRows.forEach((row, i) => put('vouchers', row.id, newVoucherIds[i]));
+
+    const logRows = (d.edit_log || []).map(({ id: _old, ...rest }) => {
+      const target = tableForEntityType(rest.entity_type);
+      const mapped = target ? look(target, rest.entity_id) : companyId;
+      return {
+        ...rest,
+        company_id: companyId,
+        entity_id: mapped ?? rest.entity_id,
+        snapshot: parseStored(rest.snapshot, {}),
+        changes: parseStored(rest.changes, []),
+      };
+    });
+    await insertMany('edit_log', logRows);
 
     return { company: await getCompany(companyId), restored: dump.counts || {} };
   });
@@ -175,7 +232,7 @@ export async function restoreCompany(dump, { name } = {}) {
 async function uniqueCompanyName(name) {
   let candidate = name;
   let n = 2;
-  while (await get('SELECT id FROM companies WHERE name = ?', [candidate])) {
+  while (await exists('companies', { name: candidate })) {
     candidate = `${name} (${n})`;
     n += 1;
   }
@@ -221,14 +278,21 @@ export async function exportDataset(kind, companyId, q = {}) {
 
   switch (kind) {
     case 'ledgers': {
-      const rows = await all(
-        `SELECT l.name, g.name AS under, l.opening_balance, l.opening_balance_type,
-                l.gstin, l.registration_type, l.state, l.email, l.phone,
-                l.credit_period_days, l.credit_limit
-           FROM ledgers l JOIN groups g ON g.id = l.group_id
-          WHERE l.company_id = ? ORDER BY l.name COLLATE NOCASE`,
-        [companyId],
-      );
+      const ledgers = await find('ledgers', { company_id: companyId }, { sort: { name: 1 } });
+      const groups = await namesById('groups', ledgers.map((l) => l.group_id));
+      const rows = ledgers.filter((l) => groups.has(l.group_id)).map((l) => ({
+        name: l.name,
+        under: groups.get(l.group_id),
+        opening_balance: l.opening_balance,
+        opening_balance_type: l.opening_balance_type,
+        gstin: l.gstin,
+        registration_type: l.registration_type,
+        state: l.state,
+        email: l.email,
+        phone: l.phone,
+        credit_period_days: l.credit_period_days,
+        credit_limit: l.credit_limit,
+      }));
       return {
         headers: ['Name', 'Under', 'Opening Balance', 'Dr/Cr', 'GSTIN', 'Registration Type',
           'State', 'E-Mail', 'Phone', 'Credit Period', 'Credit Limit'],
@@ -237,12 +301,15 @@ export async function exportDataset(kind, companyId, q = {}) {
       };
     }
     case 'groups': {
-      const rows = await all(
-        `SELECT g.name, p.name AS under, g.nature, g.is_primary, g.is_reserved
-           FROM groups g LEFT JOIN groups p ON p.id = g.parent_id
-          WHERE g.company_id = ? ORDER BY g.sort_position, g.name COLLATE NOCASE`,
-        [companyId],
-      );
+      const groups = await find('groups', { company_id: companyId }, { sort: { sort_position: 1, name: 1 } });
+      const parents = await namesById('groups', groups.map((g) => g.parent_id));
+      const rows = groups.map((g) => ({
+        name: g.name,
+        under: parents.get(g.parent_id) ?? null,
+        nature: g.nature,
+        is_primary: g.is_primary,
+        is_reserved: g.is_reserved,
+      }));
       return {
         headers: ['Name', 'Under', 'Nature', 'Primary', 'Reserved'],
         rows: rows.map((r) => [r.name, r.under || '', r.nature, r.is_primary ? 'Yes' : 'No',
@@ -251,15 +318,22 @@ export async function exportDataset(kind, companyId, q = {}) {
       };
     }
     case 'stock-items': {
-      const rows = await all(
-        `SELECT s.name, sg.name AS under, u.symbol AS units, s.opening_qty, s.opening_rate,
-                s.opening_value, s.hsn_sac, s.tax_rate, s.standard_price
-           FROM stock_items s
-           LEFT JOIN stock_groups sg ON sg.id = s.stock_group_id
-           LEFT JOIN units u ON u.id = s.unit_id
-          WHERE s.company_id = ? ORDER BY s.name COLLATE NOCASE`,
-        [companyId],
-      );
+      const items = await find('stock_items', { company_id: companyId }, { sort: { name: 1 } });
+      const [groups, units] = await Promise.all([
+        namesById('stock_groups', items.map((s) => s.stock_group_id)),
+        namesById('units', items.map((s) => s.unit_id), 'symbol'),
+      ]);
+      const rows = items.map((s) => ({
+        name: s.name,
+        under: groups.get(s.stock_group_id) ?? null,
+        units: units.get(s.unit_id) ?? null,
+        opening_qty: s.opening_qty,
+        opening_rate: s.opening_rate,
+        opening_value: s.opening_value,
+        hsn_sac: s.hsn_sac,
+        tax_rate: s.tax_rate,
+        standard_price: s.standard_price,
+      }));
       return {
         headers: ['Name', 'Under', 'Units', 'Opening Qty', 'Opening Rate', 'Opening Value',
           'HSN/SAC', 'Tax Rate', 'Standard Price'],
@@ -371,10 +445,7 @@ async function resolveNames(masterKey, companyId, row) {
   const out = { ...row };
   const byName = async (table, name, col = 'name') => {
     if (!name) return null;
-    const found = await get(
-      `SELECT id FROM ${table} WHERE company_id = ? AND ${col} = ?`,
-      [companyId, String(name).trim()],
-    );
+    const found = await findOne(table, { company_id: companyId, [col]: String(name).trim() }, { project: { id: 1 } });
     return found ? found.id : null;
   };
 
@@ -400,10 +471,9 @@ async function resolveNames(masterKey, companyId, row) {
 async function resolveVoucher(companyId, row) {
   const out = { ...row };
   const ledgerId = async (name) => {
-    const found = await get(
-      'SELECT id FROM ledgers WHERE company_id = ? AND name = ?',
-      [companyId, String(name || '').trim()],
-    );
+    const found = await findOne('ledgers', { company_id: companyId, name: String(name || '').trim() }, {
+      project: { id: 1 },
+    });
     if (!found) throw badRequest(`Unknown ledger "${name}"`);
     return found.id;
   };
@@ -418,10 +488,22 @@ async function resolveVoucher(companyId, row) {
   return out;
 }
 
-/** Light maintenance: refresh the query planner's statistics. */
+/**
+ * Light maintenance: has MongoDB check every collection and its indexes for
+ * damage, and realigns the id counters with the data.
+ */
 export async function repairData() {
-  await run('EXEC sp_updatestats');
-  return { ok: true, message: 'Statistics rebuilt for every table.' };
+  const names = [...Object.keys(COLLECTIONS), 'counters'];
+  const problems = [];
+  for (const name of names) {
+    const result = await runCommand({ validate: name });
+    if (!result.valid) problems.push(`${name}: ${(result.errors || []).join('; ') || 'invalid'}`);
+  }
+  await syncCounters();
+  if (problems.length) {
+    return { ok: false, message: `Problems found in ${problems.length} collection(s): ${problems.join(' | ')}` };
+  }
+  return { ok: true, message: `Checked ${names.length} collections - no problems found. Id counters realigned.` };
 }
 
 export { createCompany };

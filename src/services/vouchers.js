@@ -1,4 +1,6 @@
-import { all, get, insert, update, run, transaction } from '../db/index.js';
+import {
+  find, findOne, exists, insert, update, transaction, buildChildren, namesById, contains, distinct,
+} from '../db/index.js';
 import { logChange, historyFor } from '../lib/editlog.js';
 import { badRequest, notFound, toNum, toBool, toStr, money } from '../lib/http.js';
 import { financialYearEnd } from './companies.js';
@@ -13,38 +15,35 @@ const INVENTORY_ONLY = new Set([
 /** Voucher types that record no financial effect at all. */
 const NON_ACCOUNTING = new Set(['Memorandum', 'Reversing Journal', 'Attendance']);
 
+/** A query-string value as a plain string (never an object/operator). */
+const str = (v) => (v == null || typeof v === 'object' ? '' : String(v));
+
 export function voucherTypes(companyId) {
-  return all(
-    `SELECT * FROM voucher_types WHERE company_id = ? AND is_inactive = 0
-      ORDER BY sort_position, name`,
-    [companyId],
-  );
+  return find('voucher_types', { company_id: companyId, is_inactive: 0 }, {
+    sort: { sort_position: 1, name: 1 },
+  });
 }
 
 async function typeById(companyId, id) {
-  const vt = await get('SELECT * FROM voucher_types WHERE id = ? AND company_id = ?', [id, companyId]);
+  const vt = await findOne('voucher_types', { id, company_id: companyId });
   if (!vt) throw notFound('Voucher type not found');
   return vt;
 }
 
 function typeByName(companyId, name) {
-  return get('SELECT * FROM voucher_types WHERE company_id = ? AND name = ?', [companyId, name]);
+  return findOne('voucher_types', { company_id: companyId, name: String(name) });
 }
 
 /** Next automatic voucher number for a type within the financial year. */
 export async function nextVoucherNumber(companyId, voucherTypeId, date) {
   const vt = await typeById(companyId, voucherTypeId);
   if (vt.numbering_method === 'Manual' || vt.numbering_method === 'None') return '';
-  const company = await get('SELECT financial_year_from FROM companies WHERE id = ?', [companyId]);
+  const company = await findOne('companies', { id: companyId }, { project: { financial_year_from: 1 } });
   const from = company?.financial_year_from || `${new Date().getFullYear()}-04-01`;
   const to = financialYearEnd(from);
-  const scoped = vt.restart_numbering === 'Never' ? [] : [from, to];
-  const rows = await all(
-    `SELECT voucher_number FROM vouchers
-      WHERE company_id = ? AND voucher_type_id = ? AND is_deleted = 0
-      ${scoped.length ? 'AND date BETWEEN ? AND ?' : ''}`,
-    [companyId, voucherTypeId, ...scoped],
-  );
+  const filter = { company_id: companyId, voucher_type_id: voucherTypeId, is_deleted: 0 };
+  if (vt.restart_numbering !== 'Never') filter.date = { $gte: from, $lte: to };
+  const rows = await find('vouchers', filter, { project: { voucher_number: 1 } });
   let max = vt.starting_number - 1;
   for (const row of rows) {
     const digits = String(row.voucher_number).replace(/\D/g, '');
@@ -54,47 +53,73 @@ export async function nextVoucherNumber(companyId, voucherTypeId, date) {
   return `${vt.prefix || ''}${next}${vt.suffix || ''}`;
 }
 
-/** Loads a voucher with all of its child rows, resolved for display. */
-export async function getVoucher(companyId, id, { includeDeleted = false } = {}) {
-  const v = await get(
-    `SELECT v.*, vt.name AS voucher_type_name, vt.parent_type, vt.affects_stock,
-            l.name AS party_name
-       FROM vouchers v
-       JOIN voucher_types vt ON vt.id = v.voucher_type_id
-       LEFT JOIN ledgers l ON l.id = v.party_ledger_id
-      WHERE v.id = ? AND v.company_id = ?`,
-    [id, companyId],
-  );
-  if (!v || (v.is_deleted && !includeDeleted)) throw notFound('Voucher not found');
-  return hydrateVoucher(v);
+/** Lines in their entry order, as SQL's `ORDER BY line_no, id` returned them. */
+const byLine = (a, b) => (a.line_no - b.line_no) || (a.id - b.id);
+
+/** Splits the stored document into the voucher header and its embedded lines. */
+function splitVoucher(doc) {
+  const { entries = [], inventory = [], bills = [], ...header } = doc;
+  return { header, entries, inventory, bills };
 }
 
-async function hydrateVoucher(v) {
-  const entries = await all(
-    `SELECT e.*, l.name AS ledger_name, c.name AS cost_centre_name
-       FROM voucher_entries e
-       JOIN ledgers l ON l.id = e.ledger_id
-       LEFT JOIN cost_centres c ON c.id = e.cost_centre_id
-      WHERE e.voucher_id = ? ORDER BY e.line_no, e.id`,
-    [v.id],
-  );
-  const inventory = await all(
-    `SELECT i.*, s.name AS stock_item_name, g.name AS godown_name, u.symbol AS unit_name
-       FROM voucher_inventory i
-       JOIN stock_items s ON s.id = i.stock_item_id
-       LEFT JOIN godowns g ON g.id = i.godown_id
-       LEFT JOIN units u ON u.id = i.unit_id
-      WHERE i.voucher_id = ? ORDER BY i.line_no, i.id`,
-    [v.id],
-  );
-  const bills = await all(
-    `SELECT b.*, l.name AS ledger_name FROM bill_allocations b
-       JOIN ledgers l ON l.id = b.ledger_id
-      WHERE b.voucher_id = ? ORDER BY b.id`,
-    [v.id],
-  );
-  return { ...v, entries, inventory, bills };
+/** Loads a voucher with all of its lines, resolved for display. */
+export async function getVoucher(companyId, id, { includeDeleted = false } = {}) {
+  const doc = await findOne('vouchers', { id, company_id: companyId });
+  if (!doc || (doc.is_deleted && !includeDeleted)) throw notFound('Voucher not found');
+  const { header, entries, inventory, bills } = splitVoucher(doc);
+  const vt = await findOne('voucher_types', { id: header.voucher_type_id });
+  if (!vt) throw notFound('Voucher not found');
+
+  const ledgerIds = [header.party_ledger_id, ...entries.map((e) => e.ledger_id), ...bills.map((b) => b.ledger_id)];
+  const [ledgers, costCentres, items, godowns, units] = await Promise.all([
+    namesById('ledgers', ledgerIds),
+    namesById('cost_centres', entries.map((e) => e.cost_centre_id)),
+    namesById('stock_items', inventory.map((i) => i.stock_item_id)),
+    namesById('godowns', inventory.map((i) => i.godown_id)),
+    namesById('units', inventory.map((i) => i.unit_id), 'symbol'),
+  ]);
+
+  return {
+    ...header,
+    voucher_type_name: vt.name,
+    parent_type: vt.parent_type,
+    affects_stock: vt.affects_stock,
+    party_name: ledgers.get(header.party_ledger_id) ?? null,
+    entries: entries
+      .filter((e) => ledgers.has(e.ledger_id))
+      .sort(byLine)
+      .map((e) => ({
+        id: e.id,
+        voucher_id: header.id,
+        ...withoutId(e),
+        ledger_name: ledgers.get(e.ledger_id),
+        cost_centre_name: costCentres.get(e.cost_centre_id) ?? null,
+      })),
+    inventory: inventory
+      .filter((i) => items.has(i.stock_item_id))
+      .sort(byLine)
+      .map((i) => ({
+        id: i.id,
+        voucher_id: header.id,
+        ...withoutId(i),
+        stock_item_name: items.get(i.stock_item_id),
+        godown_name: godowns.get(i.godown_id) ?? null,
+        unit_name: units.get(i.unit_id) ?? null,
+      })),
+    bills: bills
+      .filter((b) => ledgers.has(b.ledger_id))
+      .sort((a, b) => a.id - b.id)
+      .map((b) => ({
+        id: b.id,
+        entry_id: b.entry_id,
+        voucher_id: header.id,
+        ...withoutId(b),
+        ledger_name: ledgers.get(b.ledger_id),
+      })),
+  };
 }
+
+const withoutId = ({ id: _id, ...rest }) => rest;
 
 /** The readable snapshot stored in the Edit Log. */
 export function voucherSnapshot(v) {
@@ -153,8 +178,9 @@ async function validate(companyId, vt, body, entries, inventory) {
     let cr = 0;
     for (const e of entries) {
       if (!e.ledger_id) throw badRequest('Each ledger entry needs a ledger');
-      const exists = await get('SELECT id FROM ledgers WHERE id = ? AND company_id = ?', [e.ledger_id, companyId]);
-      if (!exists) throw badRequest('Unknown ledger in entries');
+      if (!(await exists('ledgers', { id: e.ledger_id, company_id: companyId }))) {
+        throw badRequest('Unknown ledger in entries');
+      }
       if (e.dr_cr === 'Dr') dr += e.amount;
       else cr += e.amount;
     }
@@ -168,8 +194,32 @@ async function validate(companyId, vt, body, entries, inventory) {
 
   for (const i of inventory) {
     if (!i.stock_item_id) throw badRequest('Each inventory line needs a stock item');
-    const exists = await get('SELECT id FROM stock_items WHERE id = ? AND company_id = ?', [i.stock_item_id, companyId]);
-    if (!exists) throw badRequest('Unknown stock item in inventory entries');
+    if (!(await exists('stock_items', { id: i.stock_item_id, company_id: companyId }))) {
+      throw badRequest('Unknown stock item in inventory entries');
+    }
+  }
+}
+
+/**
+ * Every id a voucher points at must exist in the same company - the guarantee
+ * SQL Server's foreign keys used to give, for the references `validate` does
+ * not already check.
+ */
+async function assertReferences(companyId, partyLedgerId, entries, inventory, bills) {
+  const checks = [
+    ['ledgers', [partyLedgerId, ...entries.map((e) => e.ledger_id), ...bills.map((b) => b.ledger_id)]],
+    ['cost_centres', entries.map((e) => e.cost_centre_id)],
+    ['stock_items', inventory.map((i) => i.stock_item_id)],
+    ['godowns', inventory.map((i) => i.godown_id)],
+    ['units', inventory.map((i) => i.unit_id)],
+  ];
+  for (const [table, values] of checks) {
+    const ids = [...new Set(values.filter((v) => v != null))];
+    if (!ids.length) continue;
+    const found = await distinct(table, 'id', { id: { $in: ids }, company_id: companyId });
+    if (found.length !== ids.length) {
+      throw badRequest('That reference does not exist. Pick an existing record from the list.');
+    }
   }
 }
 
@@ -226,14 +276,13 @@ function parseBills(body) {
     }));
 }
 
-async function writeChildren(voucherId, entries, inventory, bills) {
-  // bill allocations reference entries, so they go first
-  await run('DELETE FROM bill_allocations WHERE voucher_id = ?', [voucherId]);
-  await run('DELETE FROM voucher_entries WHERE voucher_id = ?', [voucherId]);
-  await run('DELETE FROM voucher_inventory WHERE voucher_id = ?', [voucherId]);
-  for (const e of entries) await insert('voucher_entries', { ...e, voucher_id: voucherId });
-  for (const i of inventory) await insert('voucher_inventory', { ...i, voucher_id: voucherId });
-  for (const b of bills) await insert('bill_allocations', { ...b, voucher_id: voucherId, entry_id: null });
+/** The embedded lines as stored: defaults applied and fresh line ids. */
+async function buildLines(entries, inventory, bills) {
+  return {
+    entries: await buildChildren('entries', entries),
+    inventory: await buildChildren('inventory', inventory),
+    bills: await buildChildren('bills', bills.map((b) => ({ ...b, entry_id: null }))),
+  };
 }
 
 function computeTotal(entries, inventory) {
@@ -255,6 +304,8 @@ export async function createVoucher(companyId, body, actor) {
   const inventory = parseInventory(body);
   const bills = parseBills(body);
   await validate(companyId, vt, body, entries, inventory);
+  const partyLedgerId = body.party_ledger_id ? toNum(body.party_ledger_id, null) : null;
+  await assertReferences(companyId, partyLedgerId, entries, inventory, bills);
 
   let number = toStr(body.voucher_number).trim();
   if (!number && vt.numbering_method !== 'Manual' && vt.numbering_method !== 'None') {
@@ -269,7 +320,7 @@ export async function createVoucher(companyId, body, actor) {
       date: toStr(body.date),
       reference_no: toStr(body.reference_no),
       reference_date: toStr(body.reference_date),
-      party_ledger_id: body.party_ledger_id ? toNum(body.party_ledger_id, null) : null,
+      party_ledger_id: partyLedgerId,
       narration: toStr(body.narration),
       place_of_supply: toStr(body.place_of_supply),
       mode: toStr(body.mode, 'Item Invoice'),
@@ -280,8 +331,8 @@ export async function createVoucher(companyId, body, actor) {
       version_no: 1,
       created_by: actor?.username || 'admin',
       created_at: nowStamp(),
+      ...(await buildLines(entries, inventory, bills)),
     });
-    await writeChildren(id, entries, inventory, bills);
     const full = await getVoucher(companyId, id);
     await logChange({
       companyId,
@@ -316,6 +367,10 @@ export async function updateVoucher(companyId, id, body, actor) {
   const bills = body.bills ? parseBills(body) : existing.bills.map(stripBill);
   const merged = { ...existing, ...body };
   await validate(companyId, vt, merged, entries, inventory);
+  const partyLedgerId = body.party_ledger_id !== undefined
+    ? (body.party_ledger_id ? toNum(body.party_ledger_id, null) : null)
+    : existing.party_ledger_id;
+  await assertReferences(companyId, partyLedgerId, entries, inventory, bills);
 
   const before = voucherSnapshot(existing);
 
@@ -326,9 +381,7 @@ export async function updateVoucher(companyId, id, body, actor) {
       date: toStr(body.date ?? existing.date),
       reference_no: toStr(body.reference_no ?? existing.reference_no),
       reference_date: toStr(body.reference_date ?? existing.reference_date),
-      party_ledger_id: body.party_ledger_id !== undefined
-        ? (body.party_ledger_id ? toNum(body.party_ledger_id, null) : null)
-        : existing.party_ledger_id,
+      party_ledger_id: partyLedgerId,
       narration: toStr(body.narration ?? existing.narration),
       place_of_supply: toStr(body.place_of_supply ?? existing.place_of_supply),
       mode: toStr(body.mode ?? existing.mode),
@@ -338,8 +391,8 @@ export async function updateVoucher(companyId, id, body, actor) {
       version_no: existing.version_no + 1,
       altered_by: actor?.username || 'admin',
       altered_at: nowStamp(),
+      ...(await buildLines(entries, inventory, bills)),
     });
-    await writeChildren(id, entries, inventory, bills);
     const full = await getVoucher(companyId, id);
     await logChange({
       companyId,
@@ -483,51 +536,58 @@ export async function restoreVoucher(companyId, id, actor) {
 
 /** Day Book / voucher register. */
 export async function listVouchers(companyId, opts = {}) {
-  const where = ['v.company_id = ?'];
-  const params = [companyId];
-  if (!opts.includeDeleted) where.push('v.is_deleted = 0');
-  if (opts.from) { where.push('v.date >= ?'); params.push(opts.from); }
-  if (opts.to) { where.push('v.date <= ?'); params.push(opts.to); }
-  if (opts.voucherTypeId) { where.push('v.voucher_type_id = ?'); params.push(toNum(opts.voucherTypeId)); }
-  if (opts.voucherType) { where.push('vt.name = ?'); params.push(opts.voucherType); }
-  if (opts.parentType) { where.push('vt.parent_type = ?'); params.push(opts.parentType); }
-  if (opts.ledgerId) {
-    where.push('EXISTS (SELECT 1 FROM voucher_entries e WHERE e.voucher_id = v.id AND e.ledger_id = ?)');
-    params.push(toNum(opts.ledgerId));
+  const filter = { company_id: companyId };
+  if (!opts.includeDeleted) filter.is_deleted = 0;
+  if (str(opts.from) || str(opts.to)) {
+    filter.date = {};
+    if (str(opts.from)) filter.date.$gte = str(opts.from);
+    if (str(opts.to)) filter.date.$lte = str(opts.to);
   }
-  if (opts.search) {
-    where.push('(v.voucher_number LIKE ? OR v.narration LIKE ? OR l.name LIKE ?)');
-    const s = `%${opts.search}%`;
-    params.push(s, s, s);
-  }
-  const limit = toNum(opts.limit, 500);
-  const rows = await all(
-    `SELECT v.*, vt.name AS voucher_type_name, vt.parent_type, l.name AS party_name
-       FROM vouchers v
-       JOIN voucher_types vt ON vt.id = v.voucher_type_id
-       LEFT JOIN ledgers l ON l.id = v.party_ledger_id
-      WHERE ${where.join(' AND ')}
-      ORDER BY v.date DESC, v.id DESC
-      LIMIT ?`,
-    [...params, limit],
-  );
-  if (!rows.length) return [];
 
-  // one query for every voucher's entries rather than one query per voucher
-  const ids = rows.map((v) => v.id);
-  const entries = await all(
-    `SELECT e.*, l.name AS ledger_name FROM voucher_entries e
-       JOIN ledgers l ON l.id = e.ledger_id
-      WHERE e.voucher_id IN (${ids.map(() => '?').join(',')})
-      ORDER BY e.line_no, e.id`,
-    ids,
-  );
-  const byVoucher = new Map();
-  for (const e of entries) {
-    if (!byVoucher.has(e.voucher_id)) byVoucher.set(e.voucher_id, []);
-    byVoucher.get(e.voucher_id).push(e);
+  // voucher type filters: by id, by name and by parent type all narrow the type ids
+  const typeFilter = { company_id: companyId };
+  if (str(opts.voucherType)) typeFilter.name = str(opts.voucherType);
+  if (str(opts.parentType)) typeFilter.parent_type = str(opts.parentType);
+  const types = await find('voucher_types', typeFilter, { project: { id: 1, name: 1, parent_type: 1 } });
+  const typeById = new Map(types.map((t) => [t.id, t]));
+  let typeIds = types.map((t) => t.id);
+  if (str(opts.voucherTypeId)) typeIds = typeIds.filter((id) => id === toNum(opts.voucherTypeId));
+  filter.voucher_type_id = { $in: typeIds };
+
+  if (str(opts.ledgerId)) filter['entries.ledger_id'] = toNum(opts.ledgerId);
+  if (str(opts.search)) {
+    const s = contains(str(opts.search));
+    const parties = await find('ledgers', { company_id: companyId, name: s }, { project: { id: 1 } });
+    filter.$or = [
+      { voucher_number: s },
+      { narration: s },
+      { party_ledger_id: { $in: parties.map((l) => l.id) } },
+    ];
   }
-  return rows.map((v) => ({ ...v, entries: byVoucher.get(v.id) || [] }));
+
+  const docs = await find('vouchers', filter, {
+    sort: { date: -1, id: -1 },
+    limit: toNum(opts.limit, 500),
+    project: { inventory: 0, bills: 0 },
+  });
+  if (!docs.length) return [];
+
+  const ledgerIds = docs.flatMap((v) => [v.party_ledger_id, ...v.entries.map((e) => e.ledger_id)]);
+  const ledgers = await namesById('ledgers', ledgerIds);
+
+  return docs.map(({ entries, ...v }) => {
+    const vt = typeById.get(v.voucher_type_id);
+    return {
+      ...v,
+      voucher_type_name: vt.name,
+      parent_type: vt.parent_type,
+      party_name: ledgers.get(v.party_ledger_id) ?? null,
+      entries: entries
+        .filter((e) => ledgers.has(e.ledger_id))
+        .sort(byLine)
+        .map((e) => ({ id: e.id, voucher_id: v.id, ...withoutId(e), ledger_name: ledgers.get(e.ledger_id) })),
+    };
+  });
 }
 
 export function voucherHistory(companyId, id) {

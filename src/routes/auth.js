@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { wrap } from '../lib/http.js';
 import { login, logout, createUser, listUsers, publicUser } from '../lib/auth.js';
-import { get } from '../db/index.js';
+import { findOne } from '../db/index.js';
 
 const router = Router();
 
@@ -15,7 +15,7 @@ router.post('/logout', wrap(async (req, res) => {
 }));
 
 router.get('/me', wrap(async (req, res) => {
-  const u = req.actor?.id ? get('SELECT * FROM users WHERE id = ?', [req.actor.id]) : null;
+  const u = req.actor?.id ? await findOne('users', { id: req.actor.id }) : null;
   res.json({ user: publicUser(u), machine: req.actor?.machine, ip: req.actor?.ip });
 }));
 

@@ -51,27 +51,14 @@ export function money(n) {
 }
 
 /**
- * Turns a SQL Server constraint failure into something a bookkeeper can act
- * on. Anything unrecognised is passed through untouched.
+ * Turns a MongoDB failure into something a bookkeeper can act on. Anything
+ * unrecognised is passed through untouched.
  */
 export function translateDbError(err) {
-  const number = err?.number ?? err?.originalError?.info?.number;
-  const text = String(err?.message || '');
-
-  switch (number) {
-    case 547:
-      return /DELETE/i.test(text)
-        ? new ApiError(409, 'This record is still referenced elsewhere and cannot be removed.')
-        : new ApiError(400, 'That reference does not exist. Pick an existing record from the list.');
-    case 2627:
-    case 2601:
+  switch (err?.code) {
+    case 11000: // duplicate key on a unique index
       return new ApiError(409, 'A record with that name already exists.');
-    case 515:
-      return new ApiError(400, 'A required field was left empty.');
-    case 8152:
-    case 2628:
-      return new ApiError(400, 'One of the values is longer than the field allows.');
-    case 1205:
+    case 112: // write conflict between two transactions
       return new ApiError(409, 'The database was busy with another change. Please try again.');
     default:
       return err;

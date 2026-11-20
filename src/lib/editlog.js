@@ -1,4 +1,4 @@
-import { insert, get, all } from '../db/index.js';
+import { insert, find, findOne } from '../db/index.js';
 
 /**
  * Human readable captions for master/voucher fields, so the Edit Log reads
@@ -194,11 +194,12 @@ function fmt(v) {
 
 /** Next version number for an entity. */
 export async function nextVersion(companyId, entityType, entityId) {
-  const row = await get(
-    'SELECT MAX(version_no) AS v FROM edit_log WHERE company_id = ? AND entity_type = ? AND entity_id = ?',
-    [companyId, entityType, entityId],
+  const row = await findOne(
+    'edit_log',
+    { company_id: companyId, entity_type: entityType, entity_id: entityId },
+    { sort: { version_no: -1 }, project: { version_no: 1 } },
   );
-  return (row && row.v ? Number(row.v) : 0) + 1;
+  return (row && row.version_no ? Number(row.version_no) : 0) + 1;
 }
 
 /**
@@ -243,33 +244,35 @@ export async function logChange(o) {
     voucher_type: meta.voucherType || '',
     voucher_number: meta.voucherNumber || '',
     amount: meta.amount || 0,
-    snapshot: JSON.stringify(o.after ?? o.before ?? {}),
-    changes: JSON.stringify(changes),
+    snapshot: o.after ?? o.before ?? {},
+    changes,
   });
 }
 
 /** Full version history for one entity, oldest first. */
 export async function historyFor(companyId, entityType, entityId) {
-  const rows = await all(
-    `SELECT * FROM edit_log
-      WHERE company_id = ? AND entity_type = ? AND entity_id = ?
-      ORDER BY version_no ASC, id ASC`,
-    [companyId, entityType, entityId],
+  const rows = await find(
+    'edit_log',
+    { company_id: companyId, entity_type: String(entityType), entity_id: entityId },
+    { sort: { version_no: 1, id: 1 } },
   );
   return rows.map(hydrate);
 }
 
+/** Snapshots are stored as documents; rows restored from old backups may hold JSON text. */
 export function hydrate(row) {
   return {
     ...row,
-    snapshot: safeParse(row.snapshot, {}),
-    changes: safeParse(row.changes, []),
+    snapshot: parseStored(row.snapshot, {}),
+    changes: parseStored(row.changes, []),
   };
 }
 
-function safeParse(s, fallback) {
+export function parseStored(value, fallback) {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return fallback;
   try {
-    return JSON.parse(s);
+    return JSON.parse(value);
   } catch {
     return fallback;
   }
