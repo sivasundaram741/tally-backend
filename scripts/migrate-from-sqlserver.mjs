@@ -6,7 +6,17 @@
  *   npm run migrate-from-sqlserver              # load into empty collections
  *   npm run migrate-from-sqlserver -- --replace # empty the MongoDB collections first
  *
- * Source: SQLSERVER_* in backend/.env. Target: MONGODB_URI / MONGODB_DATABASE.
+ * Target: MONGODB_URI / MONGODB_DATABASE. Source: add these to backend/.env
+ * for the run (they are not kept there otherwise):
+ *
+ *   SQLSERVER_HOST=localhost        # not the machine name - it can resolve to IPv6 first
+ *   SQLSERVER_INSTANCE=SQLEXPRESS   # named instance (needs SQL Browser), or instead:
+ *   # SQLSERVER_PORT=1433
+ *   SQLSERVER_DATABASE=LedgerTrail
+ *   SQLSERVER_USER=sa
+ *   SQLSERVER_PASSWORD=...
+ *   SQLSERVER_ENCRYPT=true
+ *   SQLSERVER_TRUST_CERT=true
  */
 process.loadEnvFile(new URL('../.env', import.meta.url));
 const sql = (await import('mssql')).default;
